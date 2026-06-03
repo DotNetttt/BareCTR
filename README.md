@@ -15,3 +15,5 @@ To compile this project, you must have the **devkitPro** toolchain installed (co
 1. Open a terminal in the project's root folder:
    ```bash
    cd BareCTR
+   make
+   ```
