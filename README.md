@@ -20,3 +20,8 @@ To compile this project, you must have the **devkitPro** toolchain installed (co
    cd BareCTR
    make
    ```
+
+## About this project
+This project serves as a learning journey for me as I improve my skills in **C** programming.
+
+*Note: To assist with the development and optimization of certain parts of the code, I have used a Large Language Model (LLM) for debugging, refactoring, and explaining complex concepts.*
