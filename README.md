@@ -4,6 +4,9 @@ Adaptation of the minimalist Minecraft server **Bareiron** for Nintendo 3DS.
 
 BareCTR is a version adapted and optimized for the 3DS architecture, allowing you to host a lightweight Minecraft server directly on your console. This project preserves the original goal of Bareiron: prioritizing performance and resource efficiency.
 
+- Minecraft version: `1.21.8`
+- Protocol version: `772`
+
 ## Features
 * **Native 3DS Port:** Designed to run efficiently on Nintendo 3DS.
 * **Minimalist:** A clean approach to maximize server stability on the console.
