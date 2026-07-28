@@ -364,11 +364,11 @@ int main () {
   printf("New 3DS Speedup (804MHz + L2 Cache) ACTIVE.\n\n");
   // -------------------------------------
 
-  printf("--- Serveur Bareiron 3DS ---\n\n");
+  printf("--- Bareiron 3DS ---\n\n");
 
   soc_sharedmem = memalign(SOC_ALIGN, SOC_BUFFERSIZE);
   if(soc_sharedmem == NULL) {
-      printf("Erreur: Impossible d'allouer la memoire reseau.\n");
+      printf("Error: can't allocate network memory.\n");
       goto wait_and_exit;
   }
   Result ret = socInit(soc_sharedmem, SOC_BUFFERSIZE);
@@ -502,7 +502,7 @@ int main () {
     }
   }
 
-  printf("Fermeture du serveur...\n");
+  printf("Closing the server...\n");
   close(server_fd);
   
 wait_and_exit:
