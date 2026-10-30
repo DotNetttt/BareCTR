@@ -1,3 +1,5 @@
+#include "commands.h"
+#include "interactions.h"
 #include <3ds.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,9 +10,12 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
+#include <sys/stat.h>
 
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
@@ -24,8 +29,13 @@
 #include "registries.h"
 #include "procedures.h"
 #include "serialize.h"
+#include "anvil.h"
+#include "chunkview.h"
+#include "chunkstream.h"
+#include "runtime.h"
+#include "transport.h"
+#include "blockstates.h"
 
-// --- Configuration de la memoire reseau 3DS ---
 #define SOC_ALIGN       0x1000
 #define SOC_BUFFERSIZE  0x100000
 static u32 *soc_sharedmem = NULL;
@@ -54,6 +64,7 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
           recv_count = 0;
           return;
         }
+        if (transport_compress(client_fd)) break;
         if (sc_loginSuccess(client_fd, uuid, name)) break;
       } else if (state == STATE_CONFIGURATION) {
         if (cs_clientInformation(client_fd)) break;
@@ -145,7 +156,7 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
       break;
 
     case 0x19:
-      if (state == STATE_PLAY) cs_interact(client_fd);
+      if (state == STATE_PLAY) { PlayerData *p; if (!getPlayerData(client_fd, &p) && player_mode(p) != 3) cs_interact(client_fd); }
       break;
 
     case 0x1D:
@@ -166,17 +177,25 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
         PlayerData *player;
         if (getPlayerData(client_fd, &player)) break;
 
-        uint8_t block_feet = getBlockAt(player->x, player->y, player->z);
+        int feet_x = player->x, feet_y = player->y, feet_z = player->z;
+        if (packet_id == 0x1D || packet_id == 0x1E) {
+          if (!isfinite(x) || !isfinite(y) || !isfinite(z) || x < -32768 || x >= 32768 || z < -32768 || z >= 32768) break;
+          feet_x = (int)floor(x);
+          feet_y = y < 0 ? 0 : y > 255 ? 255 : (int)y;
+          feet_z = (int)floor(z);
+        }
+        uint8_t block_feet = getBlockAt(feet_x, feet_y, feet_z);
         uint8_t swimming = block_feet >= B_water && block_feet < B_water + 8;
 
+        if (player_is_flying(player)) player->grounded_y = feet_y;
         if (on_ground) {
-          int16_t damage = player->grounded_y - player->y - 3;
-          if (damage > 0 && (GAMEMODE == 0 || GAMEMODE == 2) && !swimming) {
+          int16_t damage = player->grounded_y - feet_y - 3;
+          if (damage > 0 && (player_mode(player) == 0 || player_mode(player) == 2) && !swimming) {
             hurtEntity(client_fd, -1, D_fall, damage);
           }
-          player->grounded_y = player->y;
-        } else if (swimming) {
-          player->grounded_y = player->y;
+          player->grounded_y = feet_y;
+        } else if (swimming || block_feet == B_ladder) {
+          player->grounded_y = feet_y;
         }
 
         if (packet_id == 0x20) break;
@@ -213,7 +232,9 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
 
         if (packet_id == 0x1F) break;
 
-        if (player->saturation == 0) {
+        if (player_mode(player) == 1 || player_mode(player) == 3) {
+          player->hunger = 20;
+        } else if (player->saturation == 0) {
           if (player->hunger > 0) player->hunger--;
           player->saturation = 200;
           sc_setHealth(client_fd, player->health, player->hunger, player->saturation);
@@ -221,12 +242,11 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
           player->saturation -= 1;
         }
 
-        short cx = x, cy = y, cz = z;
-        if (x < 0) cx -= 1;
-        if (z < 0) cz -= 1;
-        short _x = (cx < 0 ? cx - 16 : cx) / 16, _z = (cz < 0 ? cz - 16 : cz) / 16;
-        short dx = _x - (player->x < 0 ? player->x - 16 : player->x) / 16;
-        short dz = _z - (player->z < 0 ? player->z - 16 : player->z) / 16;
+        short cx = (short)floor(x), cz = (short)floor(z);
+        int cy = y < 0 ? -1 : y > 255 ? 256 : (int)y;
+        short _x = div_floor(cx, 16), _z = div_floor(cz, 16);
+        short old_x = div_floor(player->x, 16), old_z = div_floor(player->z, 16);
+        short dx = _x - old_x, dz = _z - old_z;
 
         if (cy < 0) {
           cy = 0;
@@ -243,24 +263,8 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
 
         if (dx == 0 && dz == 0) break;
 
-        int found = false;
-        for (int i = 0; i < VISITED_HISTORY; i ++) {
-          if (player->visited_x[i] == _x && player->visited_z[i] == _z) {
-            found = true;
-            break;
-          }
-        }
-        if (found) break;
-
-        for (int i = 0; i < VISITED_HISTORY - 1; i ++) {
-          player->visited_x[i] = player->visited_x[i + 1];
-          player->visited_z[i] = player->visited_z[i + 1];
-        }
-        player->visited_x[VISITED_HISTORY - 1] = _x;
-        player->visited_z[VISITED_HISTORY - 1] = _z;
-
         uint32_t r = fast_rand();
-        if ((r & 3) == 0) {
+        if (!anvil_enabled && (r & 3) == 0) {
           short mob_x = (_x + dx * VIEW_DISTANCE) * 16 + ((r >> 4) & 15);
           short mob_z = (_z + dz * VIEW_DISTANCE) * 16 + ((r >> 8) & 15);
           uint8_t mob_y = cy - 8;
@@ -287,27 +291,19 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
           }
         }
 
-        // --- GÉNÉRATION DE CHUNKS ---
-        sc_setCenterChunk(client_fd, _x, _z);
-        while (dx != 0) {
-          sc_chunkDataAndUpdateLight(client_fd, _x + dx * VIEW_DISTANCE, _z);
-          for (int i = 1; i <= VIEW_DISTANCE; i ++) {
-            sc_chunkDataAndUpdateLight(client_fd, _x + dx * VIEW_DISTANCE, _z - i);
-            sc_chunkDataAndUpdateLight(client_fd, _x + dx * VIEW_DISTANCE, _z + i);
-          }
-          dx += dx > 0 ? -1 : 1;
-        }
-        while (dz != 0) {
-          sc_chunkDataAndUpdateLight(client_fd, _x, _z + dz * VIEW_DISTANCE);
-          for (int i = 1; i <= VIEW_DISTANCE; i ++) {
-            sc_chunkDataAndUpdateLight(client_fd, _x - i, _z + dz * VIEW_DISTANCE);
-            sc_chunkDataAndUpdateLight(client_fd, _x + i, _z + dz * VIEW_DISTANCE);
-          }
-          dz += dz > 0 ? -1 : 1;
-        }
+        chunk_stream_request(player, _x, _z);
       }
       break;
 
+    case 0x37:
+      if (state == STATE_PLAY) command_creative_slot(client_fd);
+      break;
+    case 0x27:
+      if (state == STATE_PLAY) {
+        PlayerData *p; uint8_t flags = readByte(client_fd);
+        if (!getPlayerData(client_fd, &p)) command_flight(p, (flags & 2) != 0);
+      }
+      break;
     case 0x29:
       if (state == STATE_PLAY) cs_playerCommand(client_fd);
       break;
@@ -354,21 +350,21 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
 }
 
 int main () {
-  // 1. Initialisation de l'écran
   gfxInitDefault();
   consoleInit(GFX_TOP, NULL);
 
-  // --- OPTIMISATION CRITIQUE NEW 3DS ---
-  // Débride le processeur à 804MHz et active le cache L2 (2Mo)
-  osSetSpeedupEnable(true);
-  printf("New 3DS Speedup (804MHz + L2 Cache) ACTIVE.\n\n");
+  bool is_new_3ds = false;
+  APT_CheckNew3DS(&is_new_3ds);
+  osSetSpeedupEnable(is_new_3ds);
+  runtime_configure(is_new_3ds);
+  printf("%s profile: view %d, clients %d\n", is_new_3ds ? "New 3DS" : "Old 3DS", server_view_distance, server_max_clients);
   // -------------------------------------
 
-  printf("--- Bareiron 3DS ---\n\n");
+  printf("--- Serveur Bareiron 3DS ---\n\n");
 
   soc_sharedmem = memalign(SOC_ALIGN, SOC_BUFFERSIZE);
   if(soc_sharedmem == NULL) {
-      printf("Error: can't allocate network memory.\n");
+      printf("Erreur: Impossible d'allouer la memoire reseau.\n");
       goto wait_and_exit;
   }
   Result ret = socInit(soc_sharedmem, SOC_BUFFERSIZE);
@@ -384,9 +380,20 @@ int main () {
     block_changes[i].block = 0xFF;
   }
 
-  if (initSerializer()) exit(EXIT_FAILURE);
+  #ifdef __3DS__
+  if (mkdir("sdmc:/3ds", 0777) && errno != EEXIST) goto wait_and_exit;
+  if (mkdir("sdmc:/3ds/BareCTR", 0777) && errno != EEXIST) goto wait_and_exit;
+  if (chdir("sdmc:/3ds/BareCTR")) goto wait_and_exit;
+  #endif
+  int imported = anvil_open("world");
+  if (imported < 0) { printf("Invalid world/level.dat or spawn chunk.\n"); goto wait_and_exit; }
+  if (imported) printf("Anvil spawn: %d, %d, %d\n", world_spawn_x, world_spawn_y, world_spawn_z);
+  else printf("No world/level.dat: using generated terrain.\n");
+  if (initSerializer()) goto wait_and_exit;
+  if (imported && state_edits_open("world/barectr-states.bin")) { printf("Invalid block state save.\n"); goto wait_and_exit; }
 
-  int clients[MAX_PLAYERS], client_index = 0;
+  legacy_init();
+  int clients[MAX_PLAYERS];
   for (int i = 0; i < MAX_PLAYERS; i ++) {
     clients[i] = -1;
     client_states[i * 2] = -1;
@@ -405,6 +412,10 @@ int main () {
   server_addr.sin_family = AF_INET;
   server_addr.sin_addr.s_addr = INADDR_ANY;
   server_addr.sin_port = htons(PORT);
+#ifndef __3DS__
+  server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (getenv("BARECTR_TEST_PORT")) server_addr.sin_port = htons(atoi(getenv("BARECTR_TEST_PORT")));
+#endif
 
   if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
     close(server_fd);
@@ -422,87 +433,74 @@ int main () {
 
   int64_t last_tick_time = get_program_time();
   
-  // Timer pour rafraichir l'écran sans ralentir le serveur
   int64_t last_screen_update = get_program_time();
 
-  // Boucle principale
   while (aptMainLoop()) {
     
-    // --- OPTIMISATION DU VBLANK ---
-    // Ne rafraichit l'écran qu'une fois toutes les 500ms (2 fois par seconde)
-    // Ça permet au CPU de tourner à 100% sur le réseau et la génération !
-    if (get_program_time() - last_screen_update > 500) {
+    int64_t now = get_program_time();
+    if (now - last_screen_update >= 50000) {
       hidScanInput();
-      u32 kDown = hidKeysDown();
-      if (kDown & KEY_START) break; 
-
-      gfxFlushBuffers();
-      gfxSwapBuffers();
-      last_screen_update = get_program_time();
+      if (hidKeysDown() & KEY_START) break;
+      gfxFlushBuffers(); gfxSwapBuffers(); last_screen_update = now;
     }
-
-    for (int i = 0; i < MAX_PLAYERS; i ++) {
+    if (client_count < server_max_clients) for (int i = 0; i < MAX_PLAYERS; i++) {
       if (clients[i] != -1) continue;
-      clients[i] = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
-      if (clients[i] != -1) {
-        printf("Nouveau joueur connecte, fd: %d\n", clients[i]);
-        int client_flags = fcntl(clients[i], F_GETFL, 0);
-        fcntl(clients[i], F_SETFL, client_flags | O_NONBLOCK);
-        client_count ++;
+      addr_len = sizeof(client_addr);
+      int fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+      if (fd >= 0) {
+        if (transport_open(fd)) { close(fd); break; }
+        clients[i] = fd;
+        int client_flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, client_flags | O_NONBLOCK);
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        client_count++;
+        printf("Connected fd %d\n", fd);
       }
       break;
     }
-
-    client_index ++;
-    if (client_index >= MAX_PLAYERS) client_index = 0;
-    
-    if (clients[client_index] == -1) {
-        // Si personne n'est co, on dort 1 milliseconde pour ne pas faire fondre la batterie
-        svcSleepThread(1000000); 
-        continue;
-    }
-
-    int64_t time_since_last_tick = get_program_time() - last_tick_time;
-    if (time_since_last_tick > TIME_BETWEEN_TICKS) {
-      handleServerTick(time_since_last_tick);
-      last_tick_time = get_program_time();
-    }
-
-    int client_fd = clients[client_index];
-
-    recv_count = recv(client_fd, &recv_buffer, 2, MSG_PEEK);
-    if (recv_count < 2) {
-      if (recv_count == 0 || (recv_count < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        disconnectClient(&clients[client_index], 1);
+    int busy = 0;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+      int fd = clients[i]; if (fd < 0) continue;
+      if (!transport_active(fd)) { clients[i] = -1; continue; }
+      if (transport_flush(fd, 16384) < 0) { disconnectClient(&clients[i], 1); continue; }
+      for (int packet = 0; packet < 16; packet++) {
+        int ready = transport_poll(fd);
+        if (ready < 0) { disconnectClient(&clients[i], 2); break; }
+        if (!ready) break;
+        busy = 1;
+        int length = readVarInt(fd), id = readVarInt(fd);
+        if (length <= 0 || id < 0 || length < sizeVarInt(id)) { disconnectClient(&clients[i], 3); break; }
+        handlePacket(fd, length - sizeVarInt(id), id, getClientState(fd));
+        if (transport_failed(fd)) {
+          if (transport_active(fd)) disconnectClient(&clients[i], 4);
+          else clients[i] = -1;
+          break;
+        }
       }
-      continue;
     }
-
-    int length = readVarInt(client_fd);
-    if (length == VARNUM_ERROR) {
-      disconnectClient(&clients[client_index], 2);
-      continue;
+    now = get_program_time();
+    if (now - last_tick_time >= TIME_BETWEEN_TICKS) {
+      command_tick(now - last_tick_time);
+      handleServerTick(now - last_tick_time);
+      legacy_pressure_tick();
+      last_tick_time = now;
     }
-    int packet_id = readVarInt(client_fd);
-    if (packet_id == VARNUM_ERROR) {
-      disconnectClient(&clients[client_index], 3);
-      continue;
+    int64_t circuit_start = get_program_time();
+    for (int work = 0; work < server_circuit_nodes; work += 8) {
+      circuit_step(server_ticks, 8);
+      if (!circuit_pending() || get_program_time() - circuit_start >= server_circuit_budget_us) break;
     }
-    int state = getClientState(client_fd);
-    if (state == STATE_NONE && length == 254 && packet_id == 122) {
-      disconnectClient(&clients[client_index], 5);
-      continue;
+    chunk_stream_tick();
+    for (int i = 0; i < MAX_PLAYERS; i++) if (clients[i] >= 0 && transport_active(clients[i])) {
+      if (transport_flush(clients[i], 16384) < 0) disconnectClient(&clients[i], 5);
     }
-    
-    handlePacket(client_fd, length - sizeVarInt(packet_id), packet_id, state);
-    
-    if (recv_count == 0 || (recv_count == -1 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-      disconnectClient(&clients[client_index], 4);
-      continue;
-    }
+    if (!busy) svcSleepThread(1000000);
   }
+  state_edits_flush();
+  writePlayerDataToDisk();
+  writeBlockChangesToDisk(0, block_changes_count);
 
-  printf("Closing the server...\n");
+  printf("Fermeture du serveur...\n");
   close(server_fd);
   
 wait_and_exit:

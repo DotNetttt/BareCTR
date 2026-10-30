@@ -1,3 +1,4 @@
+#include "commands.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -20,6 +21,8 @@
 #include "varnum.h"
 #include "registries.h"
 #include "worldgen.h"
+#include "chunkpacket.h"
+#include "runtime.h"
 #include "crafting.h"
 #include "procedures.h"
 #include "packets.h"
@@ -189,7 +192,7 @@ int sc_finishConfiguration (int client_fd) {
 // S->C Login (play)
 int sc_loginPlay (int client_fd) {
 
-  writeVarInt(client_fd, 47 + sizeVarInt(MAX_PLAYERS) + sizeVarInt(VIEW_DISTANCE) * 2);
+  writeVarInt(client_fd, 47 + sizeVarInt(MAX_PLAYERS) + sizeVarInt(server_view_distance) * 2);
   writeByte(client_fd, 0x2B);
   // entity id
   writeUint32(client_fd, client_fd);
@@ -203,9 +206,9 @@ int sc_loginPlay (int client_fd) {
   // maxplayers
   writeVarInt(client_fd, MAX_PLAYERS);
   // view distance
-  writeVarInt(client_fd, VIEW_DISTANCE);
+  writeVarInt(client_fd, server_view_distance);
   // sim distance
-  writeVarInt(client_fd, VIEW_DISTANCE);
+  writeVarInt(client_fd, server_view_distance);
   // reduced debug info
   writeByte(client_fd, 0);
   // respawn screen
@@ -221,7 +224,7 @@ int sc_loginPlay (int client_fd) {
   // hashed seed
   writeUint64(client_fd, 0x0123456789ABCDEF);
   // gamemode
-  writeByte(client_fd, GAMEMODE);
+  writeByte(client_fd, player_mode_fd(client_fd));
   // previous gamemode
   writeByte(client_fd, 0xFF);
   // is debug
@@ -331,84 +334,16 @@ int sc_setCenterChunk (int client_fd, int x, int y) {
 // S->C Chunk Data and Update Light
 int sc_chunkDataAndUpdateLight (int client_fd, int _x, int _z) {
 
-  const int chunk_data_size = (4101 + sizeVarInt(256) + sizeof(network_block_palette)) * 20 + 6 * 12;
-  const int light_data_size = 14 + (sizeVarInt(2048) + 2048) * 26;
-
-  writeVarInt(client_fd, 11 + sizeVarInt(chunk_data_size) + chunk_data_size + light_data_size);
-  writeByte(client_fd, 0x27);
-
-  writeUint32(client_fd, _x);
-  writeUint32(client_fd, _z);
-
-  writeVarInt(client_fd, 0); // omit heightmaps
-
-  writeVarInt(client_fd, chunk_data_size);
-
-  int x = _x * 16, z = _z * 16, y;
-
-  // send 4 chunk sections (up to Y=0) with no blocks
-  for (int i = 0; i < 4; i ++) {
-    writeUint16(client_fd, 4096); // block count
-    writeByte(client_fd, 0); // block bits
-    writeVarInt(client_fd, 85); // block palette (bedrock)
-    writeByte(client_fd, 0); // biome bits
-    writeByte(client_fd, 0); // biome palette
+  size_t length;
+  const uint8_t *payload = build_chunk_packet(_x, _z, &length);
+  if (!payload) { disconnectClient(&client_fd, -1); return -1; }
+  uint8_t prefix[5]; unsigned prefix_size = 0; uint32_t remaining = length;
+  do { prefix[prefix_size++] = (remaining & 127) | (remaining > 127 ? 128 : 0); remaining >>= 7; } while (remaining);
+  if (send_all(client_fd, prefix, prefix_size) < 0 || send_all(client_fd, payload, length) < 0) {
+    disconnectClient(&client_fd, -1);
+    return -1;
   }
-  // yield to idle task
-  task_yield();
-
-  // send chunk sections
-  for (int i = 0; i < 20; i ++) {
-    y = i * 16;
-    writeUint16(client_fd, 4096); // block count
-    writeByte(client_fd, 8); // bits per entry
-    writeVarInt(client_fd, 256); // block palette length
-    // block palette as varint buffer
-    send_all(client_fd, network_block_palette, sizeof(network_block_palette));
-    // chunk section buffer
-    uint8_t biome = buildChunkSection(x, y, z);
-    send_all(client_fd, chunk_section, 4096);
-    // biome data
-    writeByte(client_fd, 0); // bits per entry
-    writeByte(client_fd, biome); // biome palette
-    // yield to idle task
-    task_yield();
-  }
-
-  // send 8 chunk sections (up to Y=192) with no blocks
-  for (int i = 0; i < 8; i ++) {
-    writeUint16(client_fd, 4096); // block count
-    writeByte(client_fd, 0); // block bits
-    writeVarInt(client_fd, 0); // block palette (air)
-    writeByte(client_fd, 0); // biome bits
-    writeByte(client_fd, 0); // biome palette
-  }
-  // yield to idle task
-  task_yield();
-
-  writeVarInt(client_fd, 0); // omit block entities
-
-  // light data
-  writeVarInt(client_fd, 1);
-  writeUint64(client_fd, 0b11111111111111111111111111);
-  writeVarInt(client_fd, 0);
-  writeVarInt(client_fd, 0);
-  writeVarInt(client_fd, 0);
-
-  // sky light array
-  writeVarInt(client_fd, 26);
-  for (int i = 0; i < 2048; i ++) chunk_section[i] = 0xFF;
-  for (int i = 2048; i < 4096; i ++) chunk_section[i] = 0;
-  for (int i = 0; i < 8; i ++) {
-    writeVarInt(client_fd, 2048);
-    send_all(client_fd, chunk_section + 2048, 2048);
-  }
-  for (int i = 0; i < 18; i ++) {
-    writeVarInt(client_fd, 2048);
-    send_all(client_fd, chunk_section, 2048);
-  }
-  // don't send block light
-  writeVarInt(client_fd, 0);
+  int x = _x * 16, z = _z * 16;
 
   // Sending block updates changes light prediciton on the client.
   // Light-emitting blocks are omitted from chunk data so that they can
@@ -527,8 +462,9 @@ int sc_openScreen (int client_fd, uint8_t window, const char *title, uint16_t le
 // C->S Use Item
 int cs_useItem (int client_fd) {
 
-  uint8_t hand = readByte(client_fd);
+  int hand = readVarInt(client_fd);
   int sequence = readVarInt(client_fd);
+  sc_acknowledgeBlockChange(client_fd, sequence);
 
   // Ignore yaw/pitch
   recv_all(client_fd, recv_buffer, 8, false);
@@ -536,7 +472,7 @@ int cs_useItem (int client_fd) {
   PlayerData *player;
   if (getPlayerData(client_fd, &player)) return 1;
 
-  handlePlayerUseItem(player, 0, 0, 0, 255);
+  if (!hand) handlePlayerUseItem(player, 0, 0, 0, 255);
 
   return 0;
 }
@@ -544,7 +480,7 @@ int cs_useItem (int client_fd) {
 // C->S Use Item On
 int cs_useItemOn (int client_fd) {
 
-  uint8_t hand = readByte(client_fd);
+  int hand = readVarInt(client_fd);
 
   int64_t pos = readInt64(client_fd);
   int x = pos >> 38;
@@ -568,7 +504,7 @@ int cs_useItemOn (int client_fd) {
   PlayerData *player;
   if (getPlayerData(client_fd, &player)) return 1;
 
-  handlePlayerUseItem(player, x, y, z, face);
+  if (!hand) handlePlayerUseItem(player, x, y, z, face);
 
   return 0;
 }
@@ -612,7 +548,6 @@ int cs_clickContainer (int client_fd) {
 
   uint8_t slot, count, craft = false;
   uint16_t item;
-  int tmp;
 
   uint16_t *p_item;
   uint8_t *p_count;
@@ -865,10 +800,10 @@ int cs_closeContainer (int client_fd) {
 // S->C Player Info Update, "Add Player" action
 int sc_playerInfoUpdateAddPlayer (int client_fd, PlayerData player) {
 
-  writeVarInt(client_fd, 21 + strlen(player.name)); // Packet length
+  writeVarInt(client_fd, 23 + strlen(player.name)); // Packet length
   writeByte(client_fd, 0x3F); // Packet ID
 
-  writeByte(client_fd, 0x01); // EnumSet: Add Player
+  writeByte(client_fd, 0x0D); // Add player, game mode and listed status
   writeByte(client_fd, 1); // Player count (1 per packet)
 
   // Player UUID
@@ -878,6 +813,8 @@ int sc_playerInfoUpdateAddPlayer (int client_fd, PlayerData player) {
   send_all(client_fd, player.name, strlen(player.name));
   // Properties (don't send any)
   writeByte(client_fd, 0);
+  writeVarInt(client_fd, player_mode_fd(player.client_fd));
+  writeByte(client_fd, 1);
 
   return 0;
 }
@@ -1065,7 +1002,7 @@ int sc_respawn (int client_fd) {
   // hashed seed
   writeUint64(client_fd, 0x0123456789ABCDEF);
   // gamemode
-  writeByte(client_fd, GAMEMODE);
+  writeByte(client_fd, player_mode_fd(client_fd));
   // previous gamemode
   writeByte(client_fd, 0xFF);
   // is debug
@@ -1127,6 +1064,7 @@ int cs_chat (int client_fd) {
   PlayerData *player;
   if (getPlayerData(client_fd, &player)) return 1;
 
+  if (server_command(player, (char *)recv_buffer)) goto cleanup;
   size_t message_len = strlen((char *)recv_buffer);
   uint8_t name_len = strlen(player->name);
 
@@ -1205,6 +1143,10 @@ int cs_chat (int client_fd) {
     // Send command guide
     const char help_msg[] = "§7Commands:\n"
     "  !msg <player> <message> - Send a private message\n"
+    "  !tps - Show tick rate and circuit backlog\n"
+    "  !gamemode <0..3|name> - Change your game mode\n"
+    "  !tp <x y z|player> - Teleport\n"
+    "  !fly [on|off] - Toggle flight\n"
     "  !help - Show this help message";
     sc_systemChat(client_fd, (char *)help_msg, (uint16_t)sizeof(help_msg) - 1);
     goto cleanup;

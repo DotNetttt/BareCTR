@@ -9,6 +9,8 @@
 #include "registries.h"
 #include "procedures.h"
 #include "worldgen.h"
+#include "anvil.h"
+#include "blockstates.h"
 
 uint32_t getChunkHash (short x, short z) {
 
@@ -158,6 +160,10 @@ uint8_t getHeightAtFromHash (int rx, int rz, int _x, int _z, uint32_t chunk_hash
 // Get terrain height at the given coordinates
 // Does *not* account for block changes
 uint8_t getHeightAt (int x, int z) {
+  if (anvil_enabled) {
+    for (int y = 255; y > 0; y--) if (anvil_block(x, y, z) != B_air) return y;
+    return 0;
+  }
 
   int _x = div_floor(x, CHUNK_SIZE);
   int _z = div_floor(z, CHUNK_SIZE);
@@ -356,6 +362,7 @@ ChunkFeature getFeatureFromAnchor (ChunkAnchor anchor) {
 }
 
 uint8_t getTerrainAt (int x, int y, int z, ChunkAnchor anchor) {
+  if (anvil_enabled) return anvil_block(x, y, z);
 
   if (y > 80) return B_air;
 
@@ -373,10 +380,14 @@ uint8_t getTerrainAt (int x, int y, int z, ChunkAnchor anchor) {
 
 uint8_t getBlockAt (int x, int y, int z) {
 
-  if (y < 0) return B_bedrock;
+  if (y < 0) return anvil_enabled ? B_air : B_bedrock;
+  if (y > 255) return B_air;
 
   uint8_t block_change = getBlockChange(x, y, z);
   if (block_change != 0xFF) return block_change;
+  uint16_t edited_state;
+  if(state_edit_get(x,y,z,&edited_state))return anvil_physics(edited_state);
+  if (anvil_enabled) return anvil_block(x, y, z);
 
   short anchor_x = div_floor(x, CHUNK_SIZE);
   short anchor_z = div_floor(z, CHUNK_SIZE);

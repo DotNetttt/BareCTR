@@ -35,7 +35,7 @@
 #define VIEW_DISTANCE 2
 
 // Time between server ticks in microseconds (default = 1s)
-#define TIME_BETWEEN_TICKS 1000000
+#define TIME_BETWEEN_TICKS 50000
 
 // Calculated from TIME_BETWEEN_TICKS
 #define TICKS_PER_SECOND ((float)1000000 / TIME_BETWEEN_TICKS)
@@ -95,7 +95,7 @@
 // Whether to sync block changes to disk on an interval, instead of syncing
 // on each change. On systems with fast random disk access, this shouldn't
 // be necessary.
-// #define DISK_SYNC_BLOCKS_ON_INTERVAL
+#define DISK_SYNC_BLOCKS_ON_INTERVAL
 
 // Time in microseconds to spend waiting for data transmission before
 // timing out. Default is 15s, which leaves 5s to prevent starving other

@@ -25,6 +25,7 @@
 #include "varnum.h"
 #include "procedures.h"
 #include "tools.h"
+#include "transport.h"
 
 #ifndef htonll
   static uint64_t htonll (uint64_t value) {
@@ -42,6 +43,11 @@
 uint64_t total_bytes_received = 0;
 
 ssize_t recv_all (int client_fd, void *buf, size_t n, uint8_t require_first) {
+  if (transport_active(client_fd)) {
+    ssize_t nread = transport_read(client_fd, buf, n);
+    if (nread > 0) total_bytes_received += nread;
+    return nread;
+  }
   char *p = buf;
   size_t total = 0;
 
@@ -90,6 +96,7 @@ ssize_t recv_all (int client_fd, void *buf, size_t n, uint8_t require_first) {
 }
 
 ssize_t send_all (int client_fd, const void *buf, ssize_t len) {
+  if (transport_active(client_fd)) return len < 0 ? -1 : transport_write(client_fd, buf, len);
   // Treat any input buffer as *uint8_t for simplicity
   const uint8_t *p = (const uint8_t *)buf;
   ssize_t sent = 0;
@@ -139,7 +146,7 @@ void discard_all (int client_fd, size_t remaining, uint8_t require_first) {
   while (remaining > 0) {
     size_t recv_n = remaining > MAX_RECV_BUF_LEN ? MAX_RECV_BUF_LEN : remaining;
     ssize_t received = recv_all(client_fd, recv_buffer, recv_n, require_first);
-    if (received < 0) return;
+    if (received <= 0) return;
     if (received > remaining) return;
     remaining -= received;
     require_first = false;
@@ -232,7 +239,7 @@ double readDouble (int client_fd) {
 ssize_t readLengthPrefixedData (int client_fd) {
   uint32_t length = readVarInt(client_fd);
   if (length >= MAX_RECV_BUF_LEN) {
-    printf("ERROR: Received length (%lu) exceeds maximum (%u)\n", length, MAX_RECV_BUF_LEN);
+    printf("ERROR: Received length (%lu) exceeds maximum (%u)\n", (unsigned long)length, MAX_RECV_BUF_LEN);
     disconnectClient(&client_fd, -1);
     recv_count = 0;
     return 0;
@@ -243,7 +250,7 @@ ssize_t readLengthPrefixedData (int client_fd) {
 // Reads a networked string into recv_buffer
 void readString (int client_fd) {
   recv_count = readLengthPrefixedData(client_fd);
-  recv_buffer[recv_count] = '\0';
+  recv_buffer[recv_count > 0 ? recv_count : 0] = '\0';
 }
 // Reads a networked string of up to N bytes into recv_buffer
 void readStringN (int client_fd, uint32_t max_length) {

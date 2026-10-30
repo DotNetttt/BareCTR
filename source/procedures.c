@@ -1,3 +1,4 @@
+#include "commands.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,11 @@
 #include "packets.h"
 #include "registries.h"
 #include "worldgen.h"
+#include "anvil.h"
+#include "chunkstream.h"
+#include "transport.h"
+#include "interactions.h"
+#include "blockstates.h"
 #include "structures.h"
 #include "serialize.h"
 #include "procedures.h"
@@ -55,9 +61,9 @@ void resetPlayerData (PlayerData *player) {
   player->health = 20;
   player->hunger = 20;
   player->saturation = 2500;
-  player->x = 8;
-  player->z = 8;
-  player->y = 80;
+  player->x = world_spawn_x;
+  player->z = world_spawn_z;
+  player->y = world_spawn_y;
   player->flags |= 0x02;
   player->grounded_y = 0;
   for (int i = 0; i < 41; i ++) {
@@ -175,6 +181,7 @@ void handlePlayerDisconnect (int client_fd) {
 
 // Marks a client as connected and broadcasts their data to other players
 void handlePlayerJoin (PlayerData* player) {
+  if (!(player->flags & 0x20)) return;
 
   // Prepare join message for broadcast
   uint8_t player_name_len = strlen(player->name);
@@ -183,6 +190,7 @@ void handlePlayerJoin (PlayerData* player) {
 
   // Inform other clients (and the joining client) of the player's name and entity
   for (int i = 0; i < MAX_PLAYERS; i ++) {
+    if (player_data[i].client_fd < 0) continue;
     sc_systemChat(player_data[i].client_fd, (char *)recv_buffer, 16 + player_name_len);
     sc_playerInfoUpdateAddPlayer(player_data[i].client_fd, *player);
     if (player_data[i].client_fd != player->client_fd) {
@@ -198,6 +206,7 @@ void handlePlayerJoin (PlayerData* player) {
 
 void disconnectClient (int *client_fd, int cause) {
   if (*client_fd == -1) return;
+  transport_close(*client_fd);
   client_count --;
   setClientState(*client_fd, STATE_NONE);
   handlePlayerDisconnect(*client_fd);
@@ -326,8 +335,13 @@ void spawnPlayer (PlayerData *player) {
 
   if (player->flags & 0x02) { // Is this a new player?
     // Determine spawning Y coordinate based on terrain height
-    spawn_y = getHeightAt(8, 8) + 1;
+    spawn_x = world_spawn_x + 0.5f;
+    spawn_z = world_spawn_z + 0.5f;
+    spawn_y = anvil_enabled ? world_spawn_y : getHeightAt(world_spawn_x, world_spawn_z) + 1;
+    player->x = world_spawn_x;
+    player->z = world_spawn_z;
     player->y = spawn_y;
+    player->grounded_y = player->y;
     player->flags &= ~0x02;
   } else { // Not a new player
     // Calculate spawn position from player data
@@ -338,6 +352,7 @@ void spawnPlayer (PlayerData *player) {
     spawn_pitch = player->pitch * 90 / 127;
   }
 
+  player->grounded_y = player->y;
   // Teleport player to spawn coordinates (first pass)
   sc_synchronizePlayerPosition(player->client_fd, spawn_x, spawn_y, spawn_z, spawn_yaw, spawn_pitch);
 
@@ -371,22 +386,15 @@ void spawnPlayer (PlayerData *player) {
   short _x = div_floor(player->x, 16), _z = div_floor(player->z, 16);
 
   // Indicate that we're about to send chunk data
-  sc_setDefaultSpawnPosition(player->client_fd, 8, 80, 8);
+  sc_setDefaultSpawnPosition(player->client_fd, world_spawn_x, anvil_enabled ? world_spawn_y : getHeightAt(world_spawn_x, world_spawn_z) + 1, world_spawn_z);
   sc_startWaitingForChunks(player->client_fd);
   sc_setCenterChunk(player->client_fd, _x, _z);
 
   task_yield(); // Check task timer between packets
 
-  // Send spawn chunk first
-  sc_chunkDataAndUpdateLight(player->client_fd, _x, _z);
-  for (int i = -VIEW_DISTANCE; i <= VIEW_DISTANCE; i ++) {
-    for (int j = -VIEW_DISTANCE; j <= VIEW_DISTANCE; j ++) {
-      if (i == 0 && j == 0) continue;
-      sc_chunkDataAndUpdateLight(player->client_fd, _x + i, _z + j);
-    }
-  }
-  // Re-teleport player after all chunks have been sent
-  sc_synchronizePlayerPosition(player->client_fd, spawn_x, spawn_y, spawn_z, spawn_yaw, spawn_pitch);
+  command_sync(player);
+  chunk_stream_reset(player);
+  chunk_stream_request(player, _x, _z);
 
   task_yield(); // Check task timer between packets
 
@@ -397,7 +405,7 @@ void broadcastPlayerMetadata (PlayerData *player) {
   uint8_t sneaking = (player->flags & 0x04) != 0;
   uint8_t sprinting = (player->flags & 0x08) != 0;
 
-  uint8_t entity_bit_mask = 0;
+  uint8_t entity_bit_mask = player_mode(player) == 3 ? 0x20 : 0;
   if (sneaking) entity_bit_mask |= 0x02;
   if (sprinting) entity_bit_mask |= 0x08;
 
@@ -510,6 +518,7 @@ void failBlockChange (short x, uint8_t y, short z, uint8_t block) {
 }
 
 uint8_t makeBlockChange (short x, uint8_t y, short z, uint8_t block) {
+  state_edit_clear(x, y, z);
 
   // Transmit block update to all in-game clients
   for (int i = 0; i < MAX_PLAYERS; i ++) {
@@ -530,7 +539,9 @@ uint8_t makeBlockChange (short x, uint8_t y, short z, uint8_t block) {
   anchor.hash = getChunkHash(anchor.x, anchor.z);
   anchor.biome = getChunkBiome(anchor.x, anchor.z);
 
-  uint8_t is_base_block = block == getTerrainAt(x, y, z, anchor);
+  uint8_t is_base_block = anvil_enabled
+    ? block_palette[block] == anvil_state_at(x, y, z)
+    : block == getTerrainAt(x, y, z, anchor);
 
   // In the block_changes array, 0xFF indicates a missing/restored entry.
   // We track the position of the first such "gap" for when the operation
@@ -787,6 +798,7 @@ uint8_t isColumnBlock (uint8_t block) {
 
 // Checks whether the given block is non-solid
 uint8_t isPassableBlock (uint8_t block) {
+  if (block == B_ladder) return true;
   return (
     block == B_air ||
     (block >= B_water && block < B_water + 8) ||
@@ -1173,23 +1185,29 @@ void handlePlayerAction (PlayerData *player, int action, short x, short y, short
     player->flags &= ~0x10;
   }
 
+  if (player_mode(player) == 2 || player_mode(player) == 3) return;
   // Ignore further actions not pertaining to mining blocks
   if (action != 0 && action != 2) return;
 
   // In creative, only the "start mining" action is sent
   // No additional verification is performed, the block is simply removed
-  if (action == 0 && GAMEMODE == 1) {
+  if (action == 0 && player_mode(player) == 1) {
+    legacy_break_pair(x, y, z);
     makeBlockChange(x, y, z, 0);
+    legacy_refresh_power(x, y, z);
     return;
   }
 
   uint8_t block = getBlockAt(x, y, z);
 
   // If this is a "start mining" packet, the block must be instamine
-  if (action == 0 && !isInstantlyMined(player, block)) return;
+  int legacy_id = anvil_enabled ? anvil_legacy_at(x, y, z) >> 4 : -1;
+  if (action == 0 && legacy_id != 55 && !isInstantlyMined(player, block)) return;
 
+  legacy_break_pair(x, y, z);
   // Don't continue if the block change failed
   if (makeBlockChange(x, y, z, 0)) return;
+  legacy_refresh_power(x, y, z);
 
   uint16_t held_item = player->inventory_items[player->hotbar];
   uint16_t item = getMiningResult(held_item, block);
@@ -1228,6 +1246,8 @@ void handlePlayerAction (PlayerData *player, int action, short x, short y, short
 }
 
 void handlePlayerUseItem (PlayerData *player, short x, short y, short z, uint8_t face) {
+  if (player_mode(player) == 3) return;
+  if (face != 255 && legacy_interact(player, x, y, z)) return;
 
   // Get targeted block (if coordinates are provided)
   uint8_t target = face == 255 ? 0 : getBlockAt(x, y, z);
@@ -1295,6 +1315,7 @@ void handlePlayerUseItem (PlayerData *player, short x, short y, short z, uint8_t
     #endif
   }
 
+  if (player_mode(player) == 2) return;
   // If the selected slot doesn't hold any items, exit
   if (*count == 0) return;
 
@@ -1342,7 +1363,7 @@ void handlePlayerUseItem (PlayerData *player, short x, short y, short z, uint8_t
 
   // If the selected item doesn't correspond to a block, exit
   uint8_t block = I_to_B(*item);
-  if (block == 0) return;
+  // Stateful legacy items are handled below even without an internal block ID.
 
   switch (face) {
     case 0: y -= 1; break;
@@ -1354,6 +1375,14 @@ void handlePlayerUseItem (PlayerData *player, short x, short y, short z, uint8_t
     default: break;
   }
 
+  if (y < 0 || y > 255) return;
+  int placed = legacy_place(player, x, y, z, face, *item);
+  if (placed) {
+    if (placed > 0 && player_mode(player) != 1 && --*count == 0) *item = 0;
+    sc_setContainerSlot(player->client_fd, 0, serverSlotToClientSlot(0, player->hotbar), *count, *item);
+    return;
+  }
+  if (block == 0) return;
   // Check if the block's placement conditions are met
   if (
     !( // Is player in the way?
@@ -1367,8 +1396,9 @@ void handlePlayerUseItem (PlayerData *player, short x, short y, short z, uint8_t
   ) {
     // Apply server-side block change
     if (makeBlockChange(x, y, z, block)) return;
+    legacy_refresh_power(x, y, z);
     // Decrease item amount in selected slot
-    *count -= 1;
+    if (player_mode(player) != 1) *count -= 1;
     // Clear item id in slot if amount is zero
     if (*count == 0) *item = 0;
     // Calculate fluid flow
@@ -1477,6 +1507,7 @@ void hurtEntity (int entity_id, int attacker_id, uint8_t damage_type, uint8_t da
 
     PlayerData *player;
     if (getPlayerData(attacker_id, &player)) return;
+    if (player_mode(player) == 3) return;
 
     // Check if attack cooldown flag is set
     if (player->flags & 0x01) return;
@@ -1503,6 +1534,7 @@ void hurtEntity (int entity_id, int attacker_id, uint8_t damage_type, uint8_t da
 
     PlayerData *player;
     if (getPlayerData(entity_id, &player)) return;
+    if (player_mode(player) == 1 || player_mode(player) == 3) return;
 
     // Don't continue if the player is already dead
     if (player->health == 0) return;
@@ -1622,6 +1654,7 @@ void hurtEntity (int entity_id, int attacker_id, uint8_t damage_type, uint8_t da
 // Takes the time since the last tick in microseconds as the only arguemnt
 void handleServerTick (int64_t time_since_last_tick) {
 
+  command_tick(time_since_last_tick);
   // Update world time
   world_time = (world_time + time_since_last_tick / 50000) % 24000;
   // Increment server tick counter

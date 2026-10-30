@@ -1,4 +1,6 @@
 #include "globals.h"
+#include "anvil.h"
+#include "blockstates.h"
 
 #ifdef SYNC_WORLD_TO_DISK
 
@@ -7,7 +9,7 @@
   #define FILE_PATH "/littlefs/world.bin"
 #else
   #include <stdio.h>
-  #define FILE_PATH "world.bin"
+  #define FILE_PATH world_save_path
 #endif
 
 #include "tools.h"
@@ -44,7 +46,7 @@ int initSerializer () {
     // Read block changes from the start of the file directly into memory
     size_t read = fread(block_changes, 1, sizeof(block_changes), file);
     if (read != sizeof(block_changes)) {
-      printf("Read %u bytes from \"world.bin\", expected %u (block changes). Aborting.\n", read, sizeof(block_changes));
+      printf("Read %zu bytes from \"world.bin\", expected %zu (block changes). Aborting.\n", read, sizeof(block_changes));
       fclose(file);
       return 1;
     }
@@ -64,7 +66,7 @@ int initSerializer () {
     read = fread(player_data, 1, sizeof(player_data), file);
     fclose(file);
     if (read != sizeof(player_data)) {
-      printf("Read %u bytes from \"world.bin\", expected %u (player data). Aborting.\n", read, sizeof(player_data));
+      printf("Read %zu bytes from \"world.bin\", expected %zu (player data). Aborting.\n", read, sizeof(player_data));
       return 1;
     }
 
@@ -126,19 +128,11 @@ void writeBlockChangesToDisk (int from, int to) {
     return;
   }
 
-  for (int i = from; i <= to; i ++) {
-    // Seek to relevant offset in file
-    if (fseek(file, i * sizeof(BlockChange), SEEK_SET) != 0) {
-      fclose(file);
-      perror("Failed to seek in \"world.bin\". Block updates have been dropped.");
-      return;
-    }
-    // Write block change entry to file
-    if (fwrite(&block_changes[i], 1, sizeof(BlockChange), file) != sizeof(BlockChange)) {
-      fclose(file);
-      perror("Failed to write to \"world.bin\". Block updates have been dropped.");
-      return;
-    }
+  if (from < 0) from = 0;
+  if (to >= MAX_BLOCK_CHANGES) to = MAX_BLOCK_CHANGES - 1;
+  if (to >= from && (fseek(file, from * sizeof(BlockChange), SEEK_SET) ||
+      fwrite(block_changes + from, sizeof(BlockChange), to - from + 1, file) != (size_t)(to - from + 1))) {
+    perror("Failed to save block changes");
   }
 
   fclose(file);
@@ -179,6 +173,7 @@ void writeDataToDiskOnInterval () {
 
   // Write full player data and block changes buffers
   writePlayerDataToDisk();
+  if (state_edits_flush()) perror("Failed to save block states");
   #ifdef DISK_SYNC_BLOCKS_ON_INTERVAL
   writeBlockChangesToDisk(0, block_changes_count);
   #endif
