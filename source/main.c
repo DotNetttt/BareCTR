@@ -16,6 +16,7 @@
 #include <time.h>
 #include <math.h>
 #include <sys/stat.h>
+#include "dashboard.h"
 
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
@@ -351,12 +352,25 @@ void handlePacket (int client_fd, int length, int packet_id, int state) {
 
 int main () {
   gfxInitDefault();
-  consoleInit(GFX_TOP, NULL);
+  dashboard_init();
+
+  bool server_ready = false;
 
   bool is_new_3ds = false;
   APT_CheckNew3DS(&is_new_3ds);
   osSetSpeedupEnable(is_new_3ds);
   runtime_configure(is_new_3ds);
+
+  DashboardStats initial_stats = {0};
+
+  initial_stats.max_players = server_max_clients;
+  initial_stats.view_distance = server_view_distance;
+
+  dashboard_render(&initial_stats);
+
+  gfxFlushBuffers();
+  gfxSwapBuffers();
+  
   printf("%s profile: view %d, clients %d\n", is_new_3ds ? "New 3DS" : "Old 3DS", server_view_distance, server_max_clients);
   // -------------------------------------
 
@@ -426,6 +440,9 @@ int main () {
     close(server_fd);
     goto wait_and_exit;
   }
+
+  server_ready = true;
+  
   printf("Serveur ecoute sur le port %d...\n", PORT);
 
   int flags = fcntl(server_fd, F_GETFL, 0);
@@ -441,7 +458,21 @@ int main () {
     if (now - last_screen_update >= 50000) {
       hidScanInput();
       if (hidKeysDown() & KEY_START) break;
-      gfxFlushBuffers(); gfxSwapBuffers(); last_screen_update = now;
+      // gfxFlushBuffers(); gfxSwapBuffers(); last_screen_update = now;
+
+      DashboardStats stats;
+
+      stats.server_ready = server_ready;
+      stats.players = client_count;
+      stats.max_players = server_max_clients;
+      stats.view_distance = server_view_distance;
+
+      dashboard_render(&stats);
+
+      gfxFlushBuffers();
+      gfxSwapBuffers();
+
+      last_screen_update = now;
     }
     if (client_count < server_max_clients) for (int i = 0; i < MAX_PLAYERS; i++) {
       if (clients[i] != -1) continue;

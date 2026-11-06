@@ -32,8 +32,8 @@ include $(DEVKITARM)/3ds_rules
 #     - <libctru folder>/default_icon.png
 #---------------------------------------------------------------------------------
 TARGET		:=	BareCTR
-APP_TITLE := BareCTR
-APP_DESCRIPTION := Minecraft server with Anvil world support
+APP_TITLE := BareCTR Dashboard
+APP_DESCRIPTION := Minecraft server dashboard for Nintendo 3DS
 APP_AUTHOR := DotNetttt
 ICON := data/icon.png
 BUILD		:=	build
