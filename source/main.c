@@ -458,7 +458,6 @@ int main () {
     if (now - last_screen_update >= 50000) {
       hidScanInput();
       if (hidKeysDown() & KEY_START) break;
-      // gfxFlushBuffers(); gfxSwapBuffers(); last_screen_update = now;
 
       DashboardStats stats;
 
@@ -469,11 +468,16 @@ int main () {
 
       dashboard_render(&stats);
 
+      // Envoyer les modifications et échanger les buffers
       gfxFlushBuffers();
       gfxSwapBuffers();
 
+      // Attendre le prochain rafraîchissement vertical
+      gspWaitForVBlank();
+
       last_screen_update = now;
     }
+
     if (client_count < server_max_clients) for (int i = 0; i < MAX_PLAYERS; i++) {
       if (clients[i] != -1) continue;
       addr_len = sizeof(client_addr);
